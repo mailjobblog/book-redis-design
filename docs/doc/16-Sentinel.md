@@ -1,4 +1,51 @@
 # 第16章 Sentinel
+
+Sentinel（哨岗、哨兵）是Redis的高可用性（high availability）解决方案：由一个或多个Sentinel实例（instance）组成的Sentinel系统（system）可以监视任意多个主服务器，以及这些主服务器属下的所有从服务器，并在被监视的主服务器进入下线状态时，自动将下线主服务器属下的某个从服务器升级为新的主服务器，然后由新的主服务器代替已下线的主服务器继续处理命令请求。
+
+![img](../images/000371.jpg)
+
+图16-1　服务器与Sentinel系统
+
+图16-1展示了一个Sentinel系统监视服务器的例子，其中：
+
+- 用双环图案表示的是当前的主服务器server1。
+
+- 用单环图案表示的是主服务器的三个从服务器server2、server3以及server4。
+
+- server2、server3、server4三个从服务器正在复制主服务器server1，而Sentinel系统则在监视所有四个服务器。
+
+假设这时，主服务器server1进入下线状态，那么从服务器server2、server3、server4对主服务器的复制操作将被中止，并且Sentinel系统会察觉到server1已下线，如图16-2所示（下线的服务器用虚线表示）。
+
+![img](../images/000090.jpg)
+
+图16-2 主服务器下线
+
+当server1的下线时长超过用户设定的下线时长上限时，Sentinel系统就会对server1执行故障转移操作：
+
+- 首先，Sentinel系统会挑选server1属下的其中一个从服务器，并将这个被选中的从服务器升级为新的主服务器。
+
+- 之后，Sentinel系统会向server1属下的所有从服务器发送新的复制指令，让它们成为新的主服务器的从服务器，当所有从服务器都开始复制新的主服务器时，故障转移操作执行完毕。
+
+- 另外，Sentinel还会继续监视已下线的server1，并在它重新上线时，将它设置为新的主服务器的从服务器。
+
+举个例子，图16-3展示了Sentinel系统将server2升级为新的主服务器，并让服务器server3和server4成为server2的从服务器的过程。
+
+之后，如果server1重新上线的话，它将被Sentinel系统降级为server2的从服务器，如图16-4所示。
+
+![img](../images/000098.jpg)
+
+图16-3　故障转移
+
+![img](../images/000105.jpg)
+
+图16-4　原来的主服务器被降级为从服务器
+
+本章首先会对Sentinel的初始化过程进行介绍，并说明Sentinel和一般Redis服务器的区别。
+
+在此之后，本章将对Sentinel监视服务器的方法和原理进行介绍，说明Sentinel是如何判断一个服务器是否在线的。
+
+最后，本章将介绍Sentinel系统对主服务器执行故障转移的整个过程。
+
 ## 16.1 启动并初始化Sentinel
 
 启动一个 Sentinel 可以使用命令：
@@ -262,13 +309,556 @@ sentinel failover-timeout master2 450000
 接下来的一节将介绍 Sentinel 是如何通过命令连接和订阅连接来与被监视主服务器进行通讯的。
 
 ## 16.2 获取主服务器信息
+
+Sentinel默认会以每十秒一次的频率，通过命令连接向被监视的主服务器发送INFO命令，并通过分析INFO命令的回复来获取主服务器的当前信息。
+
+![img](../images/000135.jpg)
+
+图16-9　Sentinel向带有三个从服务器的主服务器发送INFO命令
+
+举个例子，假设如图16-9所示，主服务器master有三个从服务器slave0、slave1和slave2，并且一个Sentinel正在连接主服务器，那么Sentinel将持续地向主服务器发送INFO命令，并获得类似于以下内容的回复：
+
+```
+# Server
+...
+run_id:7611c59dc3a29aa6fa0609f841bb6a1019008a9c
+...
+# Replication
+role:master
+...
+slave0:ip=127.0.0.1,port=11111,state=online,offset=43,lag=0
+slave1:ip=127.0.0.1,port=22222,state=online,offset=43,lag=0
+slave2:ip=127.0.0.1,port=33333,state=online,offset=43,lag=0
+...
+# Other sections
+...
+```
+
+通过分析主服务器返回的INFO命令回复，Sentinel可以获取以下两方面的信息：
+
+- 一方面是关于主服务器本身的信息，包括run_id域记录的服务器运行ID，以及role域记录的服务器角色；
+
+- 另一方面是关于主服务器属下所有从服务器的信息，每个从服务器都由一个"slave"字符串开头的行记录，每行的ip=域记录了从服务器的IP地址，而port=域则记录了从服务器的端口号。根据这些IP地址和端口号，Sentinel无须用户提供从服务器的地址信息，就可以自动发现从服务器。
+
+根据run_id域和role域记录的信息，Sentinel将对主服务器的实例结构进行更新，例如，主服务器重启之后，它的运行ID就会和实例结构之前保存的运行ID不同，Sentinel检测到这一情况之后，就会对实例结构的运行ID进行更新。
+
+至于主服务器返回的从服务器信息，则会被用于更新主服务器实例结构的slaves字典，这个字典记录了主服务器属下从服务器的名单：
+
+- 字典的键是由Sentinel自动设置的从服务器名字，格式为ip:port：如对于IP地址为127.0.0.1，端口号为11111的从服务器来说，Sentinel为它设置的名字就是127.0.0.1:11111。
+
+- 至于字典的值则是从服务器对应的实例结构：比如说，如果键是127.0.0.1:11111，那么这个键的值就是IP地址为127.0.0.1，端口号为11111的从服务器的实例结构。
+
+Sentinel在分析INFO命令中包含的从服务器信息时，会检查从服务器对应的实例结构是否已经存在于slaves字典：
+
+- 如果从服务器对应的实例结构已经存在，那么Sentinel对从服务器的实例结构进行更新。
+
+- 如果从服务器对应的实例结构不存在，那么说明这个从服务器是新发现的从服务器，Sentinel会在slaves字典中为这个从服务器新创建一个实例结构。
+
+对于我们之前列举的主服务器master和三个从服务器slave0、slave1和slave2的例子来说，Sentinel将分别为三个从服务器创建它们各自的实例结构，并将这些结构保存到主服务器实例结构的slaves字典里面，如图16-10所示。
+
+![img](../images/000404.jpg)
+
+图16-10　主服务器和它的三个从服务器
+
+注意对比图中主服务器实例结构和从服务器实例结构之间的区别：
+
+- 主服务器实例结构的flags属性的值为SRI_MASTER，而从服务器实例结构的flags属性的值为SRI_SLAVE。
+
+- 主服务器实例结构的name属性的值是用户使用Sentinel配置文件设置的，而从服务器实例结构的name属性的值则是Sentinel根据从服务器的IP地址和端口号自动设置的。
+
 ## 16.3 获取从服务器信息
+
+当Sentinel发现主服务器有新的从服务器出现时，Sentinel除了会为这个新的从服务器创建相应的实例结构之外，Sentinel还会创建连接到从服务器的命令连接和订阅连接。
+
+举个例子，对于图16-10所示的主从服务器关系来说，Sentinel将对slave0、slave1和slave2三个从服务器分别创建命令连接和订阅连接，如图16-11所示。
+
+![img](../images/000310.jpg)
+
+图16-11　Sentinel与各个从服务器建立命令连接和订阅连接
+
+在创建命令连接之后，Sentinel在默认情况下，会以每十秒一次的频率通过命令连接向从服务器发送INFO命令，并获得类似于以下内容的回复：
+
+```
+# Server
+...
+run_id:32be0699dd27b410f7c90dada3a6fab17f97899f
+...
+# Replication
+role:slave
+master_host:127.0.0.1
+master_port:6379
+master_link_status:up
+slave_repl_offset:11887
+slave_priority:100
+# Other sections
+...
+```
+
+根据INFO命令的回复，Sentinel会提取出以下信息：
+
+- 从服务器的运行ID run_id。
+
+- 从服务器的角色role。
+
+- 主服务器的IP地址master_host，以及主服务器的端口号master_port。
+
+- 主从服务器的连接状态master_link_status。
+
+- 从服务器的优先级slave_priority。
+
+- 从服务器的复制偏移量slave_repl_offset。
+
+根据这些信息，Sentinel会对从服务器的实例结构进行更新，图16-12展示了Sentinel根据上面的INFO命令回复对从服务器的实例结构进行更新之后，实例结构的样子。
+
+![img](../images/000222.jpg)
+
+图16-12　从服务器实例结构
+
 ## 16.4 向主服务器和从服务器发送信息
+
+在默认情况下，Sentinel会以每两秒一次的频率，通过命令连接向所有被监视的主服务器和从服务器发送以下格式的命令：
+
+```
+PUBLISH __sentinel__:hello "<s_ip>,<s_port>,<s_runid>,<s_epoch>,<m_name>,<m_ip>,<m_port>,<m_epoch>"
+```
+
+这条命令向服务器的__sentinel__:hello频道发送了一条信息，信息的内容由多个参数组成：
+
+- 其中以s_开头的参数记录的是Sentinel本身的信息，各个参数的意义如表16-2所示。
+
+- 而m_开头的参数记录的则是主服务器的信息，各个参数的意义如表16-3所示。如果Sentinel正在监视的是主服务器，那么这些参数记录的就是主服务器的信息；如果Sentinel正在监视的是从服务器，那么这些参数记录的就是从服务器正在复制的主服务器的信息。
+
+表16-2　信息中和Sentinel有关的参数
+
+![img](../images/000306.jpg)
+
+表16-3　信息中和主服务器有关的参数
+
+![img](../images/000298.jpg)
+
+以下是一条Sentinel通过PUBLISH命令向主服务器发送的信息示例：
+
+```
+"127.0.0.1,26379,e955b4c85598ef5b5f055bc7ebfd5e828dbed4fa,0,mymaster,127.0.0.1,6379,0"
+```
+
+这个示例包含了以下信息：
+
+- Sentinel的IP地址为127.0.0.1端口号为26379，运行ID为e955b4c85598ef5b5f055bc7ebfd5e828dbed4fa，当前的配置纪元为0。
+
+- 主服务器的名字为mymaster，IP地址为127.0.0.1，端口号为6379，当前的配置纪元为0。
+
 ## 16.5 接收来自主服务器和从服务器的频道信息
+
+当Sentinel与一个主服务器或者从服务器建立起订阅连接之后，Sentinel就会通过订阅连接，向服务器发送以下命令：
+
+```
+SUBSCRIBE __sentinel__:hello
+```
+
+Sentinel对__sentinel__:hello频道的订阅会一直持续到Sentinel与服务器的连接断开为止。
+
+这也就是说，对于每个与Sentinel连接的服务器，Sentinel既通过命令连接向服务器的__sentinel__:hello频道发送信息，又通过订阅连接从服务器的__sentinel__:hello频道接收信息，如图16-13所示。
+
+![img](../images/000034.jpg)
+
+图16-13　Sentinel同时向服务器发送和接收信息
+
+对于监视同一个服务器的多个Sentinel来说，一个Sentinel发送的信息会被其他Sentinel接收到，这些信息会被用于更新其他Sentinel对发送信息Sentinel的认知，也会被用于更新其他Sentinel对被监视服务器的认知。
+
+举个例子，假设现在有sentinel1、sentinel2、sentinel3三个Sentinel在监视同一个服务器，那么当sentinel1向服务器的__sentinel__:hello频道发送一条信息时，所有订阅了__sentinel__:hello频道的Sentinel（包括sentinel1自己在内）都会收到这条信息，如图16-14所示。
+
+![img](../images/000001.jpg)
+
+图16-14　向服务器发送信息
+
+当一个Sentinel从__sentinel__:hello频道收到一条信息时，Sentinel会对这条信息进行分析，提取出信息中的Sentinel IP地址、Sentinel端口号、Sentinel运行ID等八个参数，并进行以下检查：
+
+- 如果信息中记录的Sentinel运行ID和接收信息的Sentinel的运行ID相同，那么说明这条信息是Sentinel自己发送的，Sentinel将丢弃这条信息，不做进一步处理。
+
+- 相反地，如果信息中记录的Sentinel运行ID和接收信息的Sentinel的运行ID不相同，那么说明这条信息是监视同一个服务器的其他Sentinel发来的，接收信息的Sentinel将根据信息中的各个参数，对相应主服务器的实例结构进行更新。
+
+### 16.5.1　更新sentinels字典
+
+Sentinel为主服务器创建的实例结构中的sentinels字典保存了除Sentinel本身之外，所有同样监视这个主服务器的其他Sentinel的资料：
+
+- sentinels字典的键是其中一个Sentinel的名字，格式为ip:port，比如对于IP地址为127.0.0.1，端口号为26379的Sentinel来说，这个Sentinel在sentinels字典中的键就是"127.0.0.1:26379"。
+
+- sentinels字典的值则是键所对应Sentinel的实例结构，比如对于键"127.0.0.1:26379"来说，这个键在sentinels字典中的值就是IP为127.0.0.1，端口号为26379的Sentinel的实例结构。
+
+当一个Sentinel接收到其他Sentinel发来的信息时（我们称呼发送信息的Sentinel为源Sentinel，接收信息的Sentinel为目标Sentinel），目标Sentinel会从信息中分析并提取出以下两方面参数：
+
+- 与Sentinel有关的参数：源Sentinel的IP地址、端口号、运行ID和配置纪元。
+
+- 与主服务器有关的参数：源Sentinel正在监视的主服务器的名字、IP地址、端口号和配置纪元。
+
+根据信息中提取出的主服务器参数，目标Sentinel会在自己的Sentinel状态的masters字典中查找相应的主服务器实例结构，然后根据提取出的Sentinel参数，检查主服务器实例结构的sentinels字典中，源Sentinel的实例结构是否存在：
+
+- 如果源Sentinel的实例结构已经存在，那么对源Sentinel的实例结构进行更新。
+
+- 如果源Sentinel的实例结构不存在，那么说明源Sentinel是刚刚开始监视主服务器的新Sentinel，目标Sentinel会为源Sentinel创建一个新的实例结构，并将这个结构添加到sentinels字典里面。
+
+举个例子，假设分别有127.0.0.1:26379、127.0.0.1:26380、127.0.0.1:26381三个Sentinel正在监视主服务器127.0.0.1:6379，那么当127.0.0.1:26379这个Sentinel接收到以下信息时：
+
+```
+1) "message"
+2) "__sentinel__:hello"
+3) "127.0.0.1,26379,e955b4c85598ef5b5f055bc7ebfd5e828dbed4fa,0,mymaster,127.0.0.1,6379,0"
+1) "message"
+2) "__sentinel__:hello"
+3) "127.0.0.1,26381,6241bf5cf9bfc8ecd15d6eb6cc3185edfbb24903,0,mymaster,127.0.0.1,6379,0"
+1) "message"
+2) "__sentinel__:hello"
+3) "127.0.0.1,26380,a9b22fb79ae8fad28e4ea77d20398f77f6b89377,0,mymaster,127.0.0.1,6379,0"
+```
+
+Sentinel将执行以下动作：
+
+- 第一条信息的发送者为127.0.0.1:26379自己，这条信息会被忽略。
+
+- 第二条信息的发送者为127.0.0.1:26381，Sentinel会根据这条信息中提取出的内容，对sentinels字典中127.0.0.1:26381对应的实例结构进行更新。
+
+- 第三条信息的发送者为127.0.0.1:26380，Sentinel会根据这条信息中提取出的内容，对sentinels字典中127.0.0.1:26380所对应的实例结构进行更新。
+
+图16-15展示了Sentinel 127.0.0.1:26379为主服务器127.0.0.1:6379创建的实例结构，以及结构中的sentinels字典。
+
+![img](../images/000202.jpg)
+
+图16-15　主服务器实例结构中的sentinels字典
+
+和127.0.0.1:26379一样，其他两个Sentinel也会创建类似于图16-15所示的sentinels字典，区别在于字典中保存的Sentinel信息不同：
+
+- 127.0.0.1:26380创建的sentinels字典会保存127.0.0.1:26379和127.0.0.1:26381两个Sentinel的信息。
+
+- 而127.0.0.1:26381创建的sentinels字典则会保存127.0.0.1:26379和127.0.0.1:26380两个Sentinel的信息。
+
+因为一个Sentinel可以通过分析接收到的频道信息来获知其他Sentinel的存在，并通过发送频道信息来让其他Sentinel知道自己的存在，所以用户在使用Sentinel的时候并不需要提供各个Sentinel的地址信息，监视同一个主服务器的多个Sentinel可以自动发现对方。
+
+### 16.5.2　创建连向其他Sentinel的命令连接
+
+当Sentinel通过频道信息发现一个新的Sentinel时，它不仅会为新Sentinel在sentinels字典中创建相应的实例结构，还会创建一个连向新Sentinel的命令连接，而新Sentinel也同样会创建连向这个Sentinel的命令连接，最终监视同一主服务器的多个Sentinel将形成相互连接的网络：Sentinel A有连向Sentinel B的命令连接，而Sentinel B也有连向Sentinel A的命令连接。
+
+![img](../images/000253.jpg)
+
+图16-16　各个Sentinel之间的网络连接
+
+图16-16展示了三个监视同一主服务器的Sentinel之间是如何互相连接的。
+
+使用命令连接相连的各个Sentinel可以通过向其他Sentinel发送命令请求来进行信息交换，本章接下来将对Sentinel实现主观下线检测和客观下线检测的原理进行介绍，这两种检测都会使用Sentinel之间的命令连接来进行通信。
+
+> Sentinel之间不会创建订阅连接
+>
+> Sentinel在连接主服务器或者从服务器时，会同时创建命令连接和订阅连接，但是在连接其他Sentinel时，却只会创建命令连接，而不创建订阅连接。这是因为Sentinel需要通过接收主服务器或者从服务器发来的频道信息来发现未知的新Sentinel，所以才需要建立订阅连接，而相互已知的Sentinel只要使用命令连接来进行通信就足够了。
+
 ## 16.6 检测主观下线状态
+
+在默认情况下，Sentinel会以每秒一次的频率向所有与它创建了命令连接的实例（包括主服务器、从服务器、其他Sentinel在内）发送PING命令，并通过实例返回的PING命令回复来判断实例是否在线。
+
+![img](../images/000304.jpg)
+
+图16-17　Sentinel向实例发送PING命令
+
+在图16-17展示的例子中，带箭头的连线显示了Sentinel1和Sentinel2是如何向实例发送PING命令的：
+
+·Sentinel1将向Sentinel2、主服务器master、从服务器slave1和slave2发送PING命令。
+
+·Sentinel2将向Sentinel1、主服务器master、从服务器slave1和slave2发送PING命令。
+
+实例对PING命令的回复可以分为以下两种情况：
+
+·有效回复：实例返回+PONG、-LOADING、-MASTERDOWN三种回复的其中一种。
+
+·无效回复：实例返回除+PONG、-LOADING、-MASTERDOWN三种回复之外的其他回复，或者在指定时限内没有返回任何回复。
+
+Sentinel配置文件中的down-after-milliseconds选项指定了Sentinel判断实例进入主观下线所需的时间长度：如果一个实例在down-after-milliseconds毫秒内，连续向Sentinel返回无效回复，那么Sentinel会修改这个实例所对应的实例结构，在结构的flags属性中打开SRI_S_DOWN标识，以此来表示这个实例已经进入主观下线状态。
+
+以图16-17展示的情况为例子，如果配置文件指定Sentinel1的down-after-milliseconds选项的值为50000毫秒，那么当主服务器master连续50000毫秒都向Sentinel1返回无效回复时，Sentinel1就会将master标记为主观下线，并在master所对应的实例结构的flags属性中打开SRI_S_DOWN标识，如图16-18所示。
+
+![img](../images/000351.jpg)
+
+图16-18　主服务器被标记为主观下线
+
+> **主观下线时长选项的作用范围**
+>
+> 用户设置的down-after-milliseconds选项的值，不仅会被Sentinel用来判断主服务器的主观下线状态，还会被用于判断主服务器属下的所有从服务器，以及所有同样监视这个主服务器的其他Sentinel的主观下线状态。举个例子，如果用户向Sentinel设置了以下配置：
+>
+> ```
+> sentinel monitor master 127.0.0.1 6379 2
+> sentinel down-after-milliseconds master 50000
+> ```
+
+那么50000毫秒不仅会成为Sentinel判断master进入主观下线的标准，还会成为Sentinel判断master属下所有从服务器，以及所有同样监视master的其他Sentinel进入主观下线的标准。
+
+> **多个Sentinel设置的主观下线时长可能不同**
+>
+> down-after-milliseconds选项另一个需要注意的地方是，对于监视同一个主服务器的多个Sentinel来说，这些Sentinel所设置的down-after-milliseconds选项的值也可能不同，因此，当一个Sentinel将主服务器判断为主观下线时，其他Sentinel可能仍然会认为主服务器处于在线状态。举个例子，如果Sentinel1载入了以下配置：
+>
+> ```
+> sentinel monitor master 127.0.0.1 6379 2
+> sentinel down-after-milliseconds master 50000
+> ```
+>
+> 而Sentinel2则载入了以下配置：
+>
+> ```
+> sentinel monitor master 127.0.0.1 6379 2
+> sentinel down-after-milliseconds master 10000
+> ```
+
+那么当master的断线时长超过10000毫秒之后，Sentinel2会将master判断为主观下线，而Sentinel1却认为master仍然在线。只有当master的断线时长超过50000毫秒之后，Sentinel1和Sentinel2才会都认为master进入了主观下线状态。
+
 ## 16.7 检查客观下线状态
+
+当Sentinel将一个主服务器判断为主观下线之后，为了确认这个主服务器是否真的下线了，它会向同样监视这一主服务器的其他Sentinel进行询问，看它们是否也认为主服务器已经进入了下线状态（可以是主观下线或者客观下线）。当Sentinel从其他Sentinel那里接收到足够数量的已下线判断之后，Sentinel就会将从服务器判定为客观下线，并对主服务器执行故障转移操作。
+
+### 16.7.1　发送SENTINEL is-master-down-by-addr命令
+
+Sentinel使用：
+
+```
+SENTINEL is-master-down-by-addr <ip> <port> <current_epoch> <runid>
+```
+
+命令询问其他Sentinel是否同意主服务器已下线，命令中的各个参数的意义如表16-4所示。
+
+表16-4　SENTINEL is-master-down-by-addr命令各个参数的意义
+
+![img](../images/000301.jpg)
+
+举个例子，如果被Sentinel判断为主观下线的主服务器的IP为127.0.0.1，端口号为6379，并且Sentinel当前的配置纪元为0，那么Sentinel将向其他Sentinel发送以下命令：
+
+```
+SENTINEL is-master-down-by-addr 127.0.0.1 6379 0 *
+```
+
+### 16.7.2　接收SENTINEL is-master-down-by-addr命令
+
+当一个Sentinel（目标Sentinel）接收到另一个Sentinel（源Sentinel）发来的SENTINEL is-master-down-by命令时，目标Sentinel会分析并取出命令请求中包含的各个参数，并根据其中的主服务器IP和端口号，检查主服务器是否已下线，然后向源Sentinel返回一条包含三个参数的Multi Bulk回复作为SENTINEL is-master-down-by命令的回复：
+
+```
+1) <down_state>
+2) <leader_runid>
+3) <leader_epoch>
+```
+
+表16-5分别记录了这三个参数的意义。
+
+表16-5　SENTINEL is-master-down-by-addr回复的意义
+
+![img](../images/000004.jpg)
+
+举个例子，如果一个Sentinel返回以下回复作为SENTINEL is-master-down-by-addr命令的回复：
+
+```
+1) 1
+2) *
+3) 0
+```
+
+那么说明Sentinel也同意主服务器已下线。
+
+### 16.7.3　接收SENTINEL is-master-down-by-addr命令的回复
+
+根据其他Sentinel发回的SENTINEL is-master-down-by-addr命令回复，Sentinel将统计其他Sentinel同意主服务器已下线的数量，当这一数量达到配置指定的判断客观下线所需的数量时，Sentinel会将主服务器实例结构flags属性的SRI_O_DOWN标识打开，表示主服务器已经进入客观下线状态，如图16-19所示。
+
+![img](../images/000122.jpg)
+
+图16-19　主服务器被标记为客观下线
+
+> **客观下线状态的判断条件**
+>
+> 当认为主服务器已经进入下线状态的Sentinel的数量，超过Sentinel配置中设置的quorum参数的值，那么该Sentinel就会认为主服务器已经进入客观下线状态。比如说，如果Sentinel在启动时载入了以下配置：
+>
+> ```
+> sentinel monitor master 127.0.0.1 6379 2
+> ```
+>
+> 那么包括当前Sentinel在内，只要总共有两个Sentinel认为主服务器已经进入下线状态，那么当前Sentinel就将主服务器判断为客观下线。又比如说，如果Sentinel在启动时载入了以下配置：
+>
+> ```
+> sentinel monitor master 127.0.0.1 6379 5
+> ```
+>
+> 那么包括当前Sentinel在内，总共要有五个Sentinel都认为主服务器已经下线，当前Sentinel才会将主服务器判断为客观下线。
+
+
+
+> **不同Sentinel判断客观下线的条件可能不同**
+>
+> 对于监视同一个主服务器的多个Sentinel来说，它们将主服务器标判断为客观下线的条件可能也不同：当一个Sentinel将主服务器判断为客观下线时，其他Sentinel可能并不是那么认为的。比如说，对于监视同一个主服务器的五个Sentinel来说，如果Sentinel1在启动时载入了以下配置：
+>
+> ```
+> sentinel monitor master 127.0.0.1 6379 2
+> ```
+>
+> 那么当五个Sentinel中有两个Sentinel认为主服务器已经下线时，Sentinel1就会将主服务器标判断为客观下线。
+>
+> 而对于载入了以下配置的Sentinel2来说：
+>
+> ```
+> sentinel monitor master 127.0.0.1 6379 5
+> ```
+>
+> 仅有两个Sentinel认为主服务器已下线，并不会令Sentinel2将主服务器判断为客观下线。
+
 ## 16.8 选举领头Sentinel
+
+当一个主服务器被判断为客观下线时，监视这个下线主服务器的各个Sentinel会进行协商，选举出一个领头Sentinel，并由领头Sentinel对下线主服务器执行故障转移操作。
+
+以下是Redis选举领头Sentinel的规则和方法：
+
+- 所有在线的Sentinel都有被选为领头Sentinel的资格，换句话说，监视同一个主服务器的多个在线Sentinel中的任意一个都有可能成为领头Sentinel。
+
+- 每次进行领头Sentinel选举之后，不论选举是否成功，所有Sentinel的配置纪元（configuration epoch）的值都会自增一次。配置纪元实际上就是一个计数器，并没有什么特别的。
+
+- 在一个配置纪元里面，所有Sentinel都有一次将某个Sentinel设置为局部领头Sentinel的机会，并且局部领头一旦设置，在这个配置纪元里面就不能再更改。
+
+- 每个发现主服务器进入客观下线的Sentinel都会要求其他Sentinel将自己设置为局部领头Sentinel。
+
+- 当一个Sentinel（源Sentinel）向另一个Sentinel（目标Sentinel）发送SENTINEL is-master-down-by-addr命令，并且命令中的runid参数不是*符号而是源Sentinel的运行ID时，这表示源Sentinel要求目标Sentinel将前者设置为后者的局部领头Sentinel。
+
+- Sentinel设置局部领头Sentinel的规则是先到先得：最先向目标Sentinel发送设置要求的源Sentinel将成为目标Sentinel的局部领头Sentinel，而之后接收到的所有设置要求都会被目标Sentinel拒绝。
+
+- 目标Sentinel在接收到SENTINEL is-master-down-by-addr命令之后，将向源Sentinel返回一条命令回复，回复中的leader_runid参数和leader_epoch参数分别记录了目标Sentinel的局部领头Sentinel的运行ID和配置纪元。
+
+- 源Sentinel在接收到目标Sentinel返回的命令回复之后，会检查回复中leader_epoch参数的值和自己的配置纪元是否相同，如果相同的话，那么源Sentinel继续取出回复中的leader_runid参数，如果leader_runid参数的值和源Sentinel的运行ID一致，那么表示目标Sentinel将源Sentinel设置成了局部领头Sentinel。
+
+- 如果有某个Sentinel被半数以上的Sentinel设置成了局部领头Sentinel，那么这个Sentinel成为领头Sentinel。举个例子，在一个由10个Sentinel组成的Sentinel系统里面，只要有大于等于10/2+1=6个Sentinel将某个Sentinel设置为局部领头Sentinel，那么被设置的那个Sentinel就会成为领头Sentinel。
+
+- 因为领头Sentinel的产生需要半数以上Sentinel的支持，并且每个Sentinel在每个配置纪元里面只能设置一次局部领头Sentinel，所以在一个配置纪元里面，只会出现一个领头Sentinel。
+
+- 如果在给定时限内，没有一个Sentinel被选举为领头Sentinel，那么各个Sentinel将在一段时间之后再次进行选举，直到选出领头Sentinel为止。
+
+为了熟悉以上规则，让我们来看一个选举领头Sentinel的过程。
+
+假设现在有三个Sentinel正在监视同一个主服务器，并且这三个Sentinel之前已经通过SENTINEL is-master-down-by-addr命令确认主服务器进入了客观下线状态，如图16-20所示。
+
+![img](../images/000165.jpg)
+
+图16-20　三个Sentinel都发现主服务器已经进入了客观下线状态
+
+那么为了选出领头Sentinel，三个Sentinel将再次向其他Sentinel发送SENTINEL is-master-down-by-addr命令，如图16-21所示。
+
+![img](../images/000047.jpg)
+
+图16-21　Sentinel再次向其他Sentinel发送命令
+
+和检测客观下线状态时发送的SENTINEL is-master-down-by-addr命令不同，Sentinel这次发送的命令会带有Sentinel自己的运行ID，例如：
+
+```
+SENTINEL is-master-down-by-addr 127.0.0.1 6379 0 e955b4c85598ef5b5f055bc7ebfd5e828dbed4fa
+```
+
+如果接收到这个命令的Sentinel还没有设置局部领头Sentinel的话，它就会将运行ID为e955b4c85598ef5b5f055bc7ebfd5e828dbed4fa的Sentinel设置为自己的局部领头Sentinel，并返回类似以下的命令回复：
+
+```
+1) 1
+2) e955b4c85598ef5b5f055bc7ebfd5e828dbed4fa
+3) 0
+```
+
+然后接收到命令回复的Sentinel就可以根据这一回复，统计出有多少个Sentinel将自己设置成了局部领头Sentinel。
+
+根据命令请求发送的先后顺序不同，可能会有某个Sentinel的SENTINEL is-master-down-by-addr命令比起其他Sentinel发送的相同命令都更快到达，并最终胜出领头Sentinel的选举，然后这个领头Sentinel就可以开始对主服务器执行故障转移操作了。
+
 ## 16.9 故障转移
+
+在选举产生出领头Sentinel之后，领头Sentinel将对已下线的主服务器执行故障转移操作，该操作包含以下三个步骤：
+
+1）在已下线主服务器属下的所有从服务器里面，挑选出一个从服务器，并将其转换为主服务器。
+
+2）让已下线主服务器属下的所有从服务器改为复制新的主服务器。
+
+3）将已下线主服务器设置为新的主服务器的从服务器，当这个旧的主服务器重新上线时，它就会成为新的主服务器的从服务器。
+
+### 16.9.1　选出新的主服务器
+
+故障转移操作第一步要做的就是在已下线主服务器属下的所有从服务器中，挑选出一个状态良好、数据完整的从服务器，然后向这个从服务器发送SLAVEOF no one命令，将这个从服务器转换为主服务器。
+
+> **新的主服务器是怎样挑选出来的**
+>
+> 领头Sentinel会将已下线主服务器的所有从服务器保存到一个列表里面，然后按照以下规则，一项一项地对列表进行过滤：
+>
+> 1）删除列表中所有处于下线或者断线状态的从服务器，这可以保证列表中剩余的从服务器都是正常在线的。
+>
+> 2）删除列表中所有最近五秒内没有回复过领头Sentinel的INFO命令的从服务器，这可以保证列表中剩余的从服务器都是最近成功进行过通信的。
+>
+> 3）删除所有与已下线主服务器连接断开超过down-after-milliseconds*10毫秒的从服务器：down-after-milliseconds选项指定了判断主服务器下线所需的时间，而删除断开时长超过down-after-milliseconds*10毫秒的从服务器，则可以保证列表中剩余的从服务器都没有过早地与主服务器断开连接，换句话说，列表中剩余的从服务器保存的数据都是比较新的。
+>
+> 之后，领头Sentinel将根据从服务器的优先级，对列表中剩余的从服务器进行排序，并选出其中优先级最高的从服务器。
+>
+> 如果有多个具有相同最高优先级的从服务器，那么领头Sentinel将按照从服务器的复制偏移量，对具有相同最高优先级的所有从服务器进行排序，并选出其中偏移量最大的从服务器（复制偏移量最大的从服务器就是保存着最新数据的从服务器）。
+>
+> 最后，如果有多个优先级最高、复制偏移量最大的从服务器，那么领头Sentinel将按照运行ID对这些从服务器进行排序，并选出其中运行ID最小的从服务器。
+
+图16-22展示了在一次故障转移操作中，领头Sentinel向被选中的从服务器server2发送SLAVEOF no one命令的情形。
+
+![img](../images/000063.jpg)
+
+图16-22　将server2升级为主服务器
+
+在发送SLAVEOF no one命令之后，领头Sentinel会以每秒一次的频率（平时是每十秒一次），向被升级的从服务器发送INFO命令，并观察命令回复中的角色（role）信息，当被升级服务器的role从原来的slave变为master时，领头Sentinel就知道被选中的从服务器已经顺利升级为主服务器了。
+
+例如，在图16-22展示的例子中，领头Sentinel会一直向server2发送INFO命令，当server2返回的命令回复从：
+
+```
+# Replication
+role:slave
+...
+# Other sections
+...
+```
+
+变为：
+
+```
+# Replication
+role:master
+...
+# Other sections
+...
+```
+
+的时候，领头Sentinel就知道server2已经成功升级为主服务器了。
+
+![img](../images/000068.jpg)
+
+图16-23　server2成功升级为主服务器
+
+图16-23展示了server2升级成功之后，各个服务器和领头Sentinel的样子。
+
+### 16.9.2　修改从服务器的复制目标
+
+当新的主服务器出现之后，领头Sentinel下一步要做的就是，让已下线主服务器属下的所有从服务器去复制新的主服务器，这一动作可以通过向从服务器发送SLAVEOF命令来实现。
+
+图16-24展示了在故障转移操作中，领头Sentinel向已下线主服务器server1的两个从服务器server3和server4发送SLAVEOF命令，让它们复制新的主服务器server2的例子。
+
+![img](../images/000077.jpg)
+
+图16-24　让从服务器复制新的主服务器
+
+图16-25展示了server3和server4成为server2的从服务器之后，各个服务器以及领头Sentinel的样子。
+
+![img](../images/000297.jpg)
+
+图16-25　server3和server4成为server2的从服务器
+
+### 16.9.3　将旧的主服务器变为从服务器
+
+故障转移操作最后要做的是，将已下线的主服务器设置为新的主服务器的从服务器。比如说，图16-26就展示了被领头Sentinel设置为从服务器之后，服务器server1的样子。
+
+因为旧的主服务器已经下线，所以这种设置是保存在server1对应的实例结构里面的，当server1重新上线时，Sentinel就会向它发送SLAVEOF命令，让它成为server2的从服务器。
+
+例如，图16-27就展示了server1重新上线并成为server2的从服务器的例子。
+
+![img](../images/000376.jpg)
+
+图16-26　server1被设置为新主服务器的从服务器
+
+![img](../images/000315.jpg)
+
+图16-27　server1重新上线并成为server2的从服务器
+
 ## 16.10 重点回顾
 
 - Sentinel 只是一个运行在特殊模式下的 Redis 服务器， 它使用了和普通模式不同的命令表， 所以 Sentinel 模式能够使用的命令和普通 Redis 服务器能够使用的命令不同。

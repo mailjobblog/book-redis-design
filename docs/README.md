@@ -18,6 +18,8 @@ https://book-redis-design.netlify.app
 
 [旧版《Redis 设计与实现》](http://origin.redisbook.com/) —— 本书的上一版， 介绍了 Redis 2.6 的内部运作机制和单机功能。 要了解本书和旧版之间的区别， 请阅读 [*《Redis 设计与实现》新旧版本详细对比*](http://redisbook.com/different.html) 页面。
 
+redisbook中未解锁的资源来源于 [54manong](http://www.54manong.com/ebook/%E5%A4%A7%E6%95%B0%E6%8D%AE/20181208232851/Redis%E8%AE%BE%E8%AE%A1%E4%B8%8E%E5%AE%9E%E7%8E%B0%20(%E6%95%B0%E6%8D%AE%E5%BA%93%E6%8A%80%E6%9C%AF%E4%B8%9B%E4%B9%A6)-%E9%BB%84%E5%81%A5%E5%AE%8F%20%E8%91%97/Redis%E8%AE%BE%E8%AE%A1%E4%B8%8E%E5%AE%9E%E7%8E%B0%20(%E6%95%B0%E6%8D%AE%E5%BA%93%E6%8A%80%E6%9C%AF%E4%B8%9B%E4%B9%A6)-%E9%BB%84%E5%81%A5%E5%AE%8F%20%E8%91%97.html) ，如有侵权，请联系作者删除。
+
 ## 公众号“汀风说后端”提供技术支持
 
 公众号日常更新：技术干货、工作方案实践、学习资料分享（电子书、视频）、经典面试题解析。
